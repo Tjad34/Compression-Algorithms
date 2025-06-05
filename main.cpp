@@ -13,6 +13,8 @@
 #include <bitset>
 #include <algorithm>
 #include <iomanip>
+#include <ctime>  // For timestamp in JSON metadata
+#include <sstream>  // For string stream operations
 
 // Huffman Tree Node
 struct HuffmanNode {
@@ -29,6 +31,54 @@ struct CompareNodes {
         return a->frequency > b->frequency;
     }
 };
+
+// Base64 encoding table
+static const std::string base64_chars = 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789+/";
+
+// Base64 encoding function
+std::string base64_encode(const std::vector<uint8_t>& data) {
+    std::string ret;
+    int i = 0;
+    int j = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
+    size_t in_len = data.size();
+    const unsigned char* bytes_to_encode = data.data();
+
+    while (in_len--) {
+        char_array_3[i++] = *(bytes_to_encode++);
+        if (i == 3) {
+            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+            char_array_4[3] = char_array_3[2] & 0x3f;
+
+            for(i = 0; i < 4; i++)
+                ret += base64_chars[char_array_4[i]];
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for(j = i; j < 3; j++)
+            char_array_3[j] = '\0';
+
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        char_array_4[3] = char_array_3[2] & 0x3f;
+
+        for (j = 0; j < i + 1; j++)
+            ret += base64_chars[char_array_4[j]];
+
+        while((i++ < 3))
+            ret += '=';
+    }
+    return ret;
+}
 
 class DeltaHuffmanCompressor {
 private:
@@ -55,6 +105,26 @@ private:
         }
         return originalData;
     }
+
+    void generateCodes(const std::shared_ptr<HuffmanNode>& node, 
+                      std::string code,
+                      std::unordered_map<int16_t, std::string>& codes) {
+        if (!node) return;
+        
+        if (!node->left && !node->right) {
+            codes[node->value] = code;
+        }
+        
+        generateCodes(node->left, code + "0", codes);
+        generateCodes(node->right, code + "1", codes);
+    }
+
+    // Store delta values for metadata
+    std::vector<int16_t> lastDeltaValues;
+
+public:
+    // Store last used Huffman codes for metadata
+    std::unordered_map<int16_t, std::string> lastHuffmanCodes;
 
     // Build Huffman tree and get codes
     std::unordered_map<int16_t, std::string> buildHuffmanCodes(const std::vector<int16_t>& deltaValues) {
@@ -101,20 +171,6 @@ private:
         return huffmanCodes;
     }
 
-    void generateCodes(const std::shared_ptr<HuffmanNode>& node, 
-                      std::string code,
-                      std::unordered_map<int16_t, std::string>& codes) {
-        if (!node) return;
-        
-        if (!node->left && !node->right) {
-            codes[node->value] = code;
-        }
-        
-        generateCodes(node->left, code + "0", codes);
-        generateCodes(node->right, code + "1", codes);
-    }
-
-public:
     // Compress data using Delta-Huffman coding
     std::vector<uint8_t> compress(const std::vector<uint16_t>& data, size_t& compressedSize) {
         try {
@@ -203,6 +259,11 @@ public:
             compressedSize = compressedData.size();
             std::cout << "Compression complete. Original size: " << data.size() * sizeof(uint16_t) 
                       << " bytes, Compressed size: " << compressedSize << " bytes\n";
+
+            // Store the Huffman codes for metadata
+            lastHuffmanCodes = huffmanCodes;
+            lastDeltaValues = deltaValues;
+            
             return compressedData;
             
         } catch (const std::exception& e) {
@@ -340,7 +401,9 @@ public:
     }
 
     // Save compressed data to a DHC file
-    void saveToFile(const std::vector<uint8_t>& compressedData, const std::string& outputPath) {
+    void saveToFile(const std::vector<uint8_t>& compressedData, const std::string& outputPath, 
+                    const std::unordered_map<int16_t, std::string>& huffmanCodes,
+                    size_t originalSize, size_t numSamples) {
         std::cout << "Creating DHC file at: " << outputPath << "\n";
         
         // Create directories if they don't exist
@@ -374,8 +437,50 @@ public:
                                    std::to_string(compressedData.size()) + 
                                    ", Got: " + std::to_string(fileSize));
         }
+
+        // Create JSON metadata file
+        std::string jsonPath = outputPath + ".json";
+        std::ofstream jsonFile(jsonPath);
+        if (!jsonFile) {
+            throw std::runtime_error("Failed to create JSON metadata file: " + jsonPath);
+        }
+
+        // Convert compressed data to base64
+        std::string encodedData = base64_encode(compressedData);
+
+        // Write metadata in JSON format
+        jsonFile << "{\n";
+        jsonFile << "    \"originalLen\": " << numSamples << ",\n";
+        jsonFile << "    \"firstVal\": [";
+        
+        // Add first values from lastDeltaValues
+        size_t channels = originalSize / (numSamples * sizeof(uint16_t));
+        for (size_t i = 0; i < channels; i++) {
+            if (i > 0) jsonFile << ",";
+            jsonFile << "\"" << lastDeltaValues[i] << "\"";
+        }
+        jsonFile << "],\n";
+        
+        jsonFile << "    \"bitsPerSymbol\": 16,\n";
+        jsonFile << "    \"huffmanTable\": {\n";
+        
+        // Write Huffman codes
+        bool first = true;
+        for (const auto& pair : huffmanCodes) {
+            if (!first) jsonFile << ",\n";
+            jsonFile << "        \"" << pair.first << "\": \"" << pair.second << "\"";
+            first = false;
+        }
+        jsonFile << "\n    },\n";
+        
+        // Add the encoded data
+        jsonFile << "    \"encodedData\": \"" << encodedData << "\"\n";
+        jsonFile << "}\n";
+        
+        jsonFile.close();
         
         std::cout << "Successfully wrote " << fileSize << " bytes to " << outputPath << "\n";
+        std::cout << "Metadata saved to " << jsonPath << "\n";
     }
 
     // Read and decompress from a DHC file
@@ -392,7 +497,7 @@ public:
         inFile.seekg(0, std::ios::beg);
         
         compressedData.resize(fileSize);
-        inFile.read(reinterpret_cast<char*>(compressedData.data()), fileSize);
+        inFile.read(reinterpret_cast<char*>(compressedData.data()), fileSize); 
         inFile.close();
 
         // Use existing decompress function
@@ -676,7 +781,8 @@ int main(int argc, char* argv[]) {
                 std::string dhcOutputPath = std::filesystem::path(originalFile).string() + ".dhc";
                 bool dhcVerified = false;
                 try {
-                    dhCompressor.saveToFile(dhCompressedData, dhcOutputPath);
+                    dhCompressor.saveToFile(dhCompressedData, dhcOutputPath, dhCompressor.lastHuffmanCodes, 
+                                          actualSize, totalSamples);
                     std::cout << "DHC file saved successfully: " << dhcOutputPath << "\n";
                     
                     // Verify the file exists and has correct size
